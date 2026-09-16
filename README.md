@@ -48,6 +48,35 @@ conditions, one scenario per invocation:
 | `deleted`, `deleted-dispatch`, `deleted-task` | After the working directory has been removed, so that `getcwd` fails and returns null. |
 | `concurrent` | 64 simultaneous reads, to rule the accessor's thread-safety in or out. |
 | `getcwd` | The raw syscall, with no Foundation involved, as a control. |
+| `tsc-exact`, `tsc-exact-dispatch`, `tsc-exact-task`, `tsc-exact-chdir` | The **whole** TSC function, not just its first line — see below. |
+| `tsc-exact-deep-cwd` | The same, from a working directory as deep as the platform allows, to push the conversion past any small fixed-size buffer. |
+| `fsr-loop`, `fsr-loop-dispatch`, `fsr-loop-concurrent` | Thousands of allocate/read/free cycles, interleaved with unrelated allocations. A mismatched ownership contract corrupts the heap rather than faulting on the spot. |
+
+### Why `currentDirectoryPath` alone is not the whole story
+
+The first pass of this reproducer probed only
+`FileManager.default.currentDirectoryPath` and found nothing across eight
+Swift-version / libc / build-system combinations. That is because on a platform
+without the ObjC runtime — every Linux cell — TSC's accessor does three more
+things after that first line:
+
+```swift
+let cwdStr = FileManager.default.currentDirectoryPath
+guard !cwdStr.isEmpty else { return nil }
+let fsr: UnsafePointer<Int8> = cwdStr.fileSystemRepresentation  // allocates
+defer { fsr.deallocate() }                                      // frees, by hand
+return try? AbsolutePath(validating: String(cString: fsr))      // reads through it
+```
+
+`fileSystemRepresentation` is manual memory management against an ownership
+contract: swift-corelibs-foundation returns an *owned* pointer that the caller is
+expected to free, which is why TSC deallocates it, while on Darwin the same-named
+API is on `NSString` and returns an autoreleased pointer that must not be freed.
+Swift 6.4 moved Linux Foundation onto the swift-foundation rewrite underneath
+that API. A free of a pointer that is no longer owned corrupts the heap instead
+of faulting immediately, which fits both the reported symptom (a bad pointer
+dereference at a small bogus address) and the fact that it reproduces in a large,
+long-lived tool but not in a short probe.
 
 The `deleted-*` scenarios also call `getcwd` directly first, so the output shows
 what the C library reported immediately before Foundation was asked the same
@@ -89,6 +118,22 @@ a path.
 Each cell writes its result table to the job summary, so the eight cells can be
 compared directly. A cell that fails to build records a row saying so, rather
 than silently dropping out of the grid.
+
+The musl SDK is downloaded with `curl` and installed from the local file:
+`swift sdk install <url>` refuses a remote bundle unless it is given a
+`--checksum`, and swift.org does not publish one next to the download, but the
+same command accepts a local path without one.
+
+Note when running the musl builds locally: `--swift-sdk x86_64-swift-linux-musl`
+selects by triple, so it fails outright if more than one static-linux SDK is
+installed —
+
+    error: The query for `x86_64-swift-linux-musl` and host triple `...` matched
+    multiple SDKs: swift-6.3.3-RELEASE_static-linux-0.1.0,
+    swift-6.4.0-RELEASE_static-linux-0.1.0
+
+A CI runner installs exactly one, so this only bites on a development machine
+that has accumulated several.
 
 ## Reference
 

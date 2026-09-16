@@ -36,7 +36,7 @@ jobs:
       BUILD_SYSTEM: ${{ matrix.build-system }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install swiftly and Swift ${{ matrix.swift }}
         run: |

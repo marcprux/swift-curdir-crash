@@ -58,6 +58,109 @@ func readRawGetcwd(_ tag: String) {
     }
 }
 
+/// Replicates swift-tools-support-core's `LocalFileSystem.currentWorkingDirectory`
+/// *exactly*, which is what the crashing call site actually ran. Reading
+/// `currentDirectoryPath` is only its first line; on a platform without the ObjC
+/// runtime it then takes a `fileSystemRepresentation`, reads through it, and
+/// deallocates it by hand:
+///
+///     let cwdStr = FileManager.default.currentDirectoryPath
+///     guard !cwdStr.isEmpty else { return nil }
+///     let fsr: UnsafePointer<Int8> = cwdStr.fileSystemRepresentation
+///     defer { fsr.deallocate() }
+///     return try? AbsolutePath(validating: String(cString: fsr))
+///
+/// That allocate/read/free sequence is the part worth suspecting: it is manual
+/// memory management against an ownership contract (corelibs-foundation returns
+/// an owned pointer that the caller frees), and Swift 6.4 moved Linux Foundation
+/// onto the swift-foundation rewrite underneath it.
+func tscCurrentWorkingDirectory(_ tag: String) {
+    let cwdStr = FileManager.default.currentDirectoryPath
+    log("  [\(tag)] currentDirectoryPath == \"\(cwdStr)\" (\(cwdStr.utf8.count) bytes)")
+
+    guard !cwdStr.isEmpty else {
+        log("  [\(tag)] empty; TSC returns nil without going any further")
+        return
+    }
+
+#if _runtime(_ObjC)
+    log("  [\(tag)] ObjC runtime: TSC validates the String directly, no manual free")
+    _ = cwdStr.count
+#else
+    log("  [\(tag)] taking fileSystemRepresentation ...")
+    let fsr: UnsafePointer<Int8> = cwdStr.fileSystemRepresentation
+    defer {
+        log("  [\(tag)] deallocating the fileSystemRepresentation ...")
+        fsr.deallocate()
+    }
+    let roundTripped = String(cString: fsr)
+    log("  [\(tag)] round-tripped \"\(roundTripped)\"")
+#endif
+}
+
+/// The same allocate/read/free cycle, repeated. A mismatched ownership contract
+/// corrupts the heap rather than faulting on the spot, so a single pass can look
+/// perfectly healthy while the same code in a long-lived process does not.
+func fileSystemRepresentationLoop(_ tag: String, iterations: Int) {
+    let cwdStr = FileManager.default.currentDirectoryPath
+    guard !cwdStr.isEmpty else {
+        log("  [\(tag)] empty current directory; nothing to do")
+        return
+    }
+
+    var ballast: [[UInt8]] = []
+    for iteration in 0 ..< iterations {
+#if _runtime(_ObjC)
+        // Darwin exposes this on NSString, and the pointer is autoreleased
+        // rather than owned, so it must not be freed here.
+        _ = (cwdStr as NSString).fileSystemRepresentation
+#else
+        let fsr: UnsafePointer<Int8> = cwdStr.fileSystemRepresentation
+        _ = String(cString: fsr)
+        fsr.deallocate()
+#endif
+        // Interleave unrelated allocations, so that a bad free has something to
+        // damage and the damage has a chance to surface.
+        if iteration % 64 == 0 {
+            ballast.append([UInt8](repeating: 0xAB, count: 4096))
+            if ballast.count > 32 { ballast.removeFirst() }
+        }
+    }
+    log("  [\(tag)] completed \(iterations) fileSystemRepresentation cycles")
+}
+
+/// Builds a directory as deeply nested as the platform allows and moves into it,
+/// so the path is long enough to push the conversion past any small fixed-size
+/// buffer. PATH_MAX differs by platform (1024 on Darwin, 4096 on Linux), so this
+/// grows until the filesystem says no rather than assuming a depth.
+@discardableResult
+func changeIntoDeeplyNestedDirectory(maximumLevels: Int = 128) -> String {
+    var path = "/tmp/curdir-probe-deep-\(getpid())"
+    guard mkdir(path, 0o755) == 0 else {
+        log("  mkdir(\(path)) failed, errno=\(errno)")
+        exit(70)
+    }
+
+    for level in 0 ..< maximumLevels {
+        let candidate = path + "/level-\(level)-padding-padding-padding"
+        if mkdir(candidate, 0o755) != 0 {
+            // ENAMETOOLONG just means this platform's ceiling has been reached,
+            // which is exactly the depth wanted; anything else is a real problem.
+            if errno == ENAMETOOLONG { break }
+            log("  mkdir at level \(level) failed, errno=\(errno)")
+            exit(70)
+        }
+        path = candidate
+    }
+
+    guard chdir(path) == 0 else {
+        log("  chdir into the nested path failed, errno=\(errno)")
+        exit(70)
+    }
+    log("  working directory is now a \(path.utf8.count)-byte path")
+    return path
+}
+
 // MARK: - Environment manipulation
 
 /// Creates a scratch directory and makes it the process working directory,
@@ -137,6 +240,14 @@ let scenarios = [
     "deleted-task",
     "concurrent",
     "getcwd",
+    "tsc-exact",
+    "tsc-exact-dispatch",
+    "tsc-exact-task",
+    "tsc-exact-chdir",
+    "tsc-exact-deep-cwd",
+    "fsr-loop",
+    "fsr-loop-dispatch",
+    "fsr-loop-concurrent",
 ]
 
 func usage() -> Never {
@@ -213,6 +324,38 @@ case "concurrent":
 
 case "getcwd":
     readRawGetcwd("main")
+
+case "tsc-exact":
+    tscCurrentWorkingDirectory("main")
+
+case "tsc-exact-dispatch":
+    onDispatchWorker { tscCurrentWorkingDirectory("dispatch") }
+
+case "tsc-exact-task":
+    inDetachedTask { tscCurrentWorkingDirectory("task") }
+
+case "tsc-exact-chdir":
+    changeIntoScratchDirectory()
+    onDispatchWorker { tscCurrentWorkingDirectory("dispatch") }
+
+case "tsc-exact-deep-cwd":
+    changeIntoDeeplyNestedDirectory()
+    onDispatchWorker { tscCurrentWorkingDirectory("dispatch") }
+
+case "fsr-loop":
+    fileSystemRepresentationLoop("main", iterations: 20_000)
+
+case "fsr-loop-dispatch":
+    onDispatchWorker { fileSystemRepresentationLoop("dispatch", iterations: 20_000) }
+
+case "fsr-loop-concurrent":
+    let group = DispatchGroup()
+    for worker in 0 ..< 8 {
+        DispatchQueue.global().async(group: group) {
+            fileSystemRepresentationLoop("worker-\(worker)", iterations: 5_000)
+        }
+    }
+    group.wait()
 
 default:
     usage()
