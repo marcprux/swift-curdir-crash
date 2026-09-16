@@ -1,0 +1,102 @@
+name: curdir probe
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Swift ${{ matrix.swift }} / ${{ matrix.flavor }} / ${{ matrix.build-system }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # 6.4 moved Linux Foundation onto the swift-foundation rewrite
+        # (libFoundationEssentials.so), which is where the crash was seen.
+        swift: ['6.3.3', '6.4.0']
+        # glibc builds link Foundation dynamically; musl builds go through the
+        # static-linux Swift SDK and link it statically.
+        flavor: [glibc, musl]
+        # The binary that crashed was produced by swiftbuild, which became the
+        # default in 6.4; `native` is what 6.3 used. The two engines emit
+        # different link lines, so the same source can produce different
+        # binaries here even though nothing in the package changes.
+        build-system: [native, swiftbuild]
+    defaults:
+      run:
+        shell: bash
+    env:
+      SWIFT_VERSION: ${{ matrix.swift }}
+      FLAVOR: ${{ matrix.flavor }}
+      BUILD_SYSTEM: ${{ matrix.build-system }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install swiftly and Swift ${{ matrix.swift }}
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libxml2-dev
+          curl -fsSL -O "https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz"
+          tar zxf "swiftly-$(uname -m).tar.gz"
+          ./swiftly init --assume-yes --skip-install --quiet-shell-followup
+          echo "${HOME}/.local/share/swiftly/bin" >> "${GITHUB_PATH}"
+
+      - run: swiftly install --assume-yes --use "${SWIFT_VERSION}"
+
+      - run: swiftly run swift --version +"${SWIFT_VERSION}"
+
+      - name: Install the static-linux (musl) Swift SDK
+        if: matrix.flavor == 'musl'
+        run: |
+          set -eux
+          swiftly run swift sdk install \
+            "https://download.swift.org/swift-${SWIFT_VERSION}-release/static-sdk/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz" \
+            +"${SWIFT_VERSION}"
+          swiftly run swift sdk list +"${SWIFT_VERSION}"
+
+      - name: Build the probe
+        run: |
+          set -eux
+          BUILD_ARGS=(build --configuration debug --build-system "${BUILD_SYSTEM}")
+          if [[ "${FLAVOR}" == musl ]]; then
+            BUILD_ARGS+=(--swift-sdk x86_64-swift-linux-musl)
+          fi
+          swiftly run swift "${BUILD_ARGS[@]}" +"${SWIFT_VERSION}"
+          # Ask SwiftPM where the product landed rather than assuming a layout:
+          # the native and swiftbuild engines use different ones, and 6.4
+          # defaults to swiftbuild.
+          BIN_PATH=$(swiftly run swift "${BUILD_ARGS[@]}" --show-bin-path +"${SWIFT_VERSION}" | tail -1)
+          echo "PROBE_BIN=${BIN_PATH}/curdir-probe" >> "${GITHUB_ENV}"
+
+      - name: Run the probes
+        env:
+          LABEL: Swift ${{ matrix.swift }} / ${{ matrix.flavor }} / ${{ matrix.build-system }}
+        run: scripts/run-probes.sh "${PROBE_BIN}"
+
+      # A cell that cannot even be built is a result too; record it so the grid
+      # in the run summary stays complete rather than silently missing a row.
+      - name: Record a build or run failure
+        if: failure()
+        run: |
+          {
+            echo "### Swift ${SWIFT_VERSION} / ${FLAVOR} / ${BUILD_SYSTEM}"
+            echo
+            echo 'Did not produce probe results — see the job log (the build step is the usual cause).'
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the probe binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: curdir-probe-${{ matrix.swift }}-${{ matrix.flavor }}-${{ matrix.build-system }}
+          path: ${{ env.PROBE_BIN }}
+          if-no-files-found: warn
+          retention-days: 14
